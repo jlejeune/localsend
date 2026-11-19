@@ -34,12 +34,26 @@ impl Category {
     }
 }
 
+/// How a [Ui] writes its output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Style {
+    /// A terminal in raw mode: colored tags, `\r\n` line breaks and a status
+    /// line.
+    Terminal,
+
+    /// A log stream (a pipe, a file or journald): no colors, `\n` line breaks
+    /// and no status line.
+    Plain,
+}
+
 /// An append-only log (like `docker logs`) with a single in-place updated
 /// status line at the bottom for transfer progress.
 ///
-/// The terminal is in raw mode, so every line break must be `\r\n`.
+/// In [Style::Terminal] the terminal is in raw mode, so every line break must
+/// be `\r\n`.
 pub struct Ui {
     out: Stdout,
+    style: Style,
     status: Option<String>,
 
     /// While suspended (the file picker owns the alternate screen), log lines
@@ -50,8 +64,18 @@ pub struct Ui {
 
 impl Ui {
     pub fn new() -> Self {
+        Self::with_style(Style::Terminal)
+    }
+
+    /// A UI for the unattended mode: output goes to a log, not to a terminal.
+    pub fn plain() -> Self {
+        Self::with_style(Style::Plain)
+    }
+
+    fn with_style(style: Style) -> Self {
         Self {
             out: stdout(),
+            style,
             status: None,
             suspended: false,
             buffer: Vec::new(),
@@ -88,13 +112,7 @@ impl Ui {
 
     fn print_block(&mut self, category: Option<Category>, text: &str) {
         self.clear_status_line();
-        for (i, line) in text.lines().enumerate() {
-            let formatted = match (i, category) {
-                (0, Some(category)) => format!("{} {line}\r\n", category.colored_tag()),
-                (0, None) => format!("{line}\r\n"),
-                (_, Some(_)) => format!("  {line}\r\n"),
-                (_, None) => format!("{line}\r\n"),
-            };
+        for formatted in format_block(category, text, self.style) {
             match self.suspended {
                 true => self.buffer.push(formatted),
                 false => {
@@ -108,7 +126,8 @@ impl Ui {
 
     /// Replaces the status line at the bottom, or removes it with `None`.
     pub fn set_status(&mut self, status: Option<String>) {
-        if status == self.status {
+        // A log stream cannot redraw a line in place.
+        if self.style == Style::Plain || status == self.status {
             return;
         }
         self.clear_status_line();
@@ -133,6 +152,29 @@ impl Ui {
             let _ = self.out.queue(Print(line));
         }
     }
+}
+
+/// Formats a log block into one string per line: the first line carries the
+/// category tag, further lines are indented below it.
+fn format_block(category: Option<Category>, text: &str, style: Style) -> Vec<String> {
+    let line_break = match style {
+        Style::Terminal => "\r\n",
+        Style::Plain => "\n",
+    };
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| match (i, category) {
+            (0, Some(category)) => {
+                let tag = match style {
+                    Style::Terminal => category.colored_tag(),
+                    Style::Plain => category.tag().to_string(),
+                };
+                format!("{tag} {line}{line_break}")
+            }
+            (_, Some(_)) => format!("  {line}{line_break}"),
+            (_, None) => format!("{line}{line_break}"),
+        })
+        .collect()
 }
 
 /// A piece of a string that may contain ANSI escape sequences: either a
@@ -181,4 +223,51 @@ fn truncate_visible(s: &str, max: usize) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_log_line_has_an_uncolored_tag_and_a_bare_line_feed() {
+        let lines = format_block(
+            Some(Category::Receive),
+            "phone: Received 1 file",
+            Style::Plain,
+        );
+
+        assert_eq!(lines, ["R phone: Received 1 file\n"]);
+    }
+
+    #[test]
+    fn plain_log_block_indents_the_lines_after_the_first() {
+        let lines = format_block(Some(Category::Receive), "phone\nFiles (1):", Style::Plain);
+
+        assert_eq!(lines, ["R phone\n", "  Files (1):\n"]);
+    }
+
+    #[test]
+    fn plain_log_line_without_a_category_has_no_tag() {
+        let lines = format_block(None, "Ready to accept requests.", Style::Plain);
+
+        assert_eq!(lines, ["Ready to accept requests.\n"]);
+    }
+
+    #[test]
+    fn terminal_log_line_keeps_the_raw_mode_line_break() {
+        let lines = format_block(Some(Category::Discovery), "phone", Style::Terminal);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("phone\r\n"));
+    }
+
+    #[test]
+    fn plain_ui_has_no_status_line() {
+        let mut ui = Ui::plain();
+
+        ui.set_status(Some("50%".to_string()));
+
+        assert!(ui.status.is_none());
+    }
 }

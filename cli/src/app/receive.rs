@@ -112,6 +112,12 @@ fn message_of(files: &HashMap<String, FileDto>) -> Option<&str> {
 /// Maximum number of files listed in an incoming request prompt.
 const MAX_LISTED_FILES: usize = 20;
 
+/// Whether a request is declined without a prompt. The unattended mode has no
+/// keyboard to answer a prompt, so it only serves paired devices.
+fn is_refused(paired: bool, unattended: bool) -> bool {
+    unattended && !paired
+}
+
 /// The user's decision on a [`PendingReceive`].
 #[derive(Debug, PartialEq)]
 pub(super) enum Answer {
@@ -138,6 +144,23 @@ impl App {
                 self.device_confirmed(ip.to_string(), info.clone());
 
                 let alias = sanitize::single_line(&info.alias);
+                let sender = SenderTarget {
+                    host: ip.to_string(),
+                    port: info.port,
+                    protocol: info.protocol,
+                    fingerprint: cert_fingerprint.unwrap_or_else(|| info.fingerprint.clone()),
+                };
+                let paired = self.storage.paired.contains(&sender.fingerprint);
+
+                if is_refused(paired, self.unattended) {
+                    let _ = decision_tx.send(PrepareUploadDecisionV2::Decline);
+                    self.ui.log(
+                        Category::Receive,
+                        &format!("{alias}: Declined (not paired)"),
+                    );
+                    return;
+                }
+
                 if let Some(message) = message_of(&files) {
                     // Nothing to transfer: the text is the request. Accepting
                     // no file ends the session right away.
@@ -152,21 +175,26 @@ impl App {
                     return;
                 }
 
-                let sender = SenderTarget {
-                    host: ip.to_string(),
-                    port: info.port,
-                    protocol: info.protocol,
-                    fingerprint: cert_fingerprint.unwrap_or_else(|| info.fingerprint.clone()),
-                };
-
-                if self.storage.paired.contains(&sender.fingerprint) {
+                if paired {
                     let ids: HashSet<String> = files.keys().cloned().collect();
                     if decision_tx
                         .send(PrepareUploadDecisionV2::Accept(ids))
                         .is_ok()
                     {
                         // Nothing to confirm: the progress bar and the summary
-                        // are the whole story for an auto-accepted request.
+                        // are the whole story for an auto-accepted request. A
+                        // log has no progress bar, so it gets a line instead.
+                        if self.unattended {
+                            let total: u64 = files.values().map(|file| file.size).sum();
+                            self.ui.log(
+                                Category::Receive,
+                                &format!(
+                                    "{alias}: Receiving files ({}, {})",
+                                    files.len(),
+                                    util::format_bytes(total)
+                                ),
+                            );
+                        }
                         self.receive = Some(ReceiveSession::new(session_id, alias, sender, files));
                     }
                 } else {
@@ -513,7 +541,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MESSAGE_BYTES, message_of};
+    use super::{MAX_MESSAGE_BYTES, is_refused, message_of};
     use localsend::model::transfer::FileDto;
     use std::collections::HashMap;
 
@@ -548,5 +576,21 @@ mod tests {
         assert_eq!(message_of(&text_request(&text, 1)), None);
         // Nor send a short preview of a large file.
         assert_eq!(message_of(&text_request("preview", 42_000_000)), None);
+    }
+
+    #[test]
+    fn unattended_mode_refuses_a_device_that_is_not_paired() {
+        assert!(is_refused(false, true));
+    }
+
+    #[test]
+    fn unattended_mode_keeps_a_paired_device() {
+        assert!(!is_refused(true, true));
+    }
+
+    #[test]
+    fn interactive_mode_asks_instead_of_refusing() {
+        assert!(!is_refused(false, false));
+        assert!(!is_refused(true, false));
     }
 }

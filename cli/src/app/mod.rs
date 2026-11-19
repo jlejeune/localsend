@@ -81,6 +81,10 @@ pub enum AppEvent {
 
     /// A log line produced by a background task.
     Log { category: Category, text: String },
+
+    /// The process was asked to stop (Ctrl+C or SIGTERM). Only the unattended
+    /// mode listens for it: the interactive mode reads Ctrl+C as a key.
+    Shutdown,
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
@@ -95,7 +99,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 to.as_deref().map(TargetSelector::parse).transpose()?,
             )
         }
-        None => (Payload::Files(Vec::new()), None),
+        Some(Command::Receive) | None => (Payload::Files(Vec::new()), None),
     };
     if let Payload::Files(paths) = &payload {
         for path in paths {
@@ -107,9 +111,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     let storage = storage::Repository::load(&args)?;
+    if matches!(args.command, Some(Command::Receive)) {
+        return run_interactive(storage, Vec::new(), true).await;
+    }
     match (target, payload) {
         (Some(target), payload) => headless::run(storage, target, payload).await,
-        (None, Payload::Files(preselected)) => run_interactive(storage, preselected).await,
+        (None, Payload::Files(preselected)) => run_interactive(storage, preselected, false).await,
         // clap only accepts `--text` together with `--to`.
         (None, Payload::Text(_)) => unreachable!("--text requires --to"),
     }
@@ -290,6 +297,10 @@ struct App {
     /// instead of the picker, and the one transfer is the whole program.
     preselected: Vec<PathBuf>,
 
+    /// Set by the `receive` command. There is no terminal and no keyboard, so
+    /// a request from a device that is not paired is declined.
+    unattended: bool,
+
     /// Returned after network tasks have shut down when a `send` command
     /// could not complete.
     exit_error: Option<anyhow::Error>,
@@ -299,9 +310,13 @@ struct App {
 
 /// The interactive mode: the append-only event log with hotkeys, and the
 /// overlays opened from them.
+///
+/// With `unattended`, there is no terminal: no raw mode and no keyboard, the
+/// log is plain, and the loop ends on Ctrl+C or SIGTERM.
 async fn run_interactive(
     storage: storage::Repository,
     preselected: Vec<PathBuf>,
+    unattended: bool,
 ) -> anyhow::Result<()> {
     let identity = storage.identity.clone();
     let (events_tx, mut events_rx) = mpsc::channel::<AppEvent>(64);
@@ -322,28 +337,30 @@ async fn run_interactive(
         identity.port,
     );
 
-    crossterm::terminal::enable_raw_mode()?;
+    if !unattended {
+        crossterm::terminal::enable_raw_mode()?;
 
-    // Keyboard reader. The blocking thread ends with the process.
-    std::thread::spawn({
-        let events_tx = events_tx.clone();
-        move || {
-            loop {
-                match crossterm::event::read() {
-                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if events_tx.blocking_send(AppEvent::Key(key)).is_err() {
-                            return;
+        // Keyboard reader. The blocking thread ends with the process.
+        std::thread::spawn({
+            let events_tx = events_tx.clone();
+            move || {
+                loop {
+                    match crossterm::event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            if events_tx.blocking_send(AppEvent::Key(key)).is_err() {
+                                return;
+                            }
                         }
+                        Ok(_) => {}
+                        Err(_) => return,
                     }
-                    Ok(_) => {}
-                    Err(_) => return,
                 }
             }
-        }
-    });
+        });
+    }
 
     let mut app = App {
-        ui: Ui::new(),
+        ui: if unattended { Ui::plain() } else { Ui::new() },
         server,
         server_stop_tx: Some(server_stop_tx),
         server_tx,
@@ -359,19 +376,27 @@ async fn run_interactive(
         send: None,
         overlay: Overlay::None,
         preselected,
+        unattended,
         exit_error: None,
         events_tx: events_tx.clone(),
     };
 
-    match app.preselected.is_empty() {
-        true => app
+    match (unattended, app.preselected.is_empty()) {
+        (true, _) => app
+            .ui
+            .log_plain(&crate::banner::render_plain(&app.storage, &app.server)),
+        (false, true) => app
             .ui
             .log_plain(&crate::banner::render(&app.storage, &app.server)),
-        false => app.open_device_list(),
+        (false, false) => app.open_device_list(),
     }
 
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Not polled in the interactive mode, so no signal handler is installed.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     let mut quit = false;
     while !quit {
@@ -381,6 +406,7 @@ async fn run_interactive(
             Some(event) = web_rx.recv() => AppEvent::Web(event),
             Some(event) = discovery_rx.recv() => AppEvent::Discovery(event),
             _ = tick.tick() => AppEvent::Tick,
+            _ = &mut shutdown, if unattended => AppEvent::Shutdown,
         };
         quit = app.dispatch(event).await;
     }
@@ -401,6 +427,36 @@ async fn run_interactive(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Completes on Ctrl+C or, on Unix, on SIGTERM (what `systemctl stop` sends).
+/// A signal that cannot be watched never completes.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let terminate = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    terminate.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 impl App {
@@ -455,6 +511,7 @@ impl App {
             // Only the headless mode acts on the end of the startup discovery.
             AppEvent::DiscoveryFinished => {}
             AppEvent::Log { category, text } => self.ui.log(category, &text),
+            AppEvent::Shutdown => return true,
         }
         false
     }

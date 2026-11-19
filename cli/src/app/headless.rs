@@ -110,8 +110,11 @@ pub(super) async fn run(
                 };
             }
             // No keyboard, no accepted receive sessions and no web links in
-            // this mode.
-            AppEvent::Key(_) | AppEvent::ReceiveFileResult { .. } | AppEvent::Web(_) => {}
+            // this mode. Only the unattended receive mode listens for signals.
+            AppEvent::Key(_)
+            | AppEvent::ReceiveFileResult { .. }
+            | AppEvent::Web(_)
+            | AppEvent::Shutdown => {}
         }
     };
     ui.set_status(None);

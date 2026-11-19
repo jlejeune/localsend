@@ -221,6 +221,28 @@ Directories are collected recursively. Their selected root names and nested path
 are preserved on the receiver. Empty directories are not sent because LocalSend
 transfers file entries rather than directory entries.
 
+To receive files on a machine with no terminal, run the `receive` command. It has no prompt and
+no keyboard input, so you can run it as a service, for example under systemd:
+
+```shell
+localsend-cli receive
+```
+
+The command accepts requests from paired devices and declines all other requests. It writes
+plain log lines without colors. It stops on Ctrl+C or on SIGTERM.
+
+Pairing tells the CLI to accept all future requests from one device. To pair a device, follow
+these steps:
+
+1. Stop the `receive` command. Both modes use port `53317`.
+2. Run `localsend-cli` in a terminal. Use the same user and the same `XDG_CONFIG_HOME` as the `receive` command.
+3. Send a file to this machine from the device that you want to pair.
+4. When the request appears, press `P`.
+5. Press Ctrl+C, then start the `receive` command again.
+
+The CLI saves the pairing in `paired-v2.json`, next to `config.toml`. The `receive` command
+reads this file only at startup.
+
 ## Contributing
 
 We welcome contributions from anyone interested in helping improve LocalSend. If you'd like to contribute, there are a few ways to get involved:

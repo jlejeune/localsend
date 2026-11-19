@@ -26,10 +26,7 @@ pub fn render(storage: &Repository, server: &ServerHandle) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let listening = match listening_lines(&server.local_addresses(), "https") {
-        lines if lines.is_empty() => " - (no network interface found)".to_string(),
-        lines => lines.join("\n"),
-    };
+    let listening = listening_text(server);
 
     format!(
         "{logo}\n\n{} {}\n{} {}\n{} {}\n{} {}\n{}\n{listening}\n\nReady to accept requests.\n\n",
@@ -43,6 +40,43 @@ pub fn render(storage: &Repository, server: &ServerHandle) -> String {
         storage.dir.display(),
         "Listening on:".green(),
     )
+}
+
+/// The start-up text of the `receive` command: plain lines for a log, with no
+/// colors and no logo.
+pub fn render_plain(storage: &Repository, server: &ServerHandle) -> String {
+    let paired = storage.paired.iter().count();
+    let mut text = format!(
+        "LocalSend CLI v{} receiving from paired devices only\n\
+         Alias: {}\n\
+         Port: {}\n\
+         Destination: {}\n\
+         Config: {}\n\
+         Paired devices: {paired}\n\
+         Listening on:\n{}",
+        env!("CARGO_PKG_VERSION"),
+        storage.identity.alias,
+        storage.identity.port,
+        storage.destination.display(),
+        storage.dir.display(),
+        listening_text(server),
+    );
+    if paired == 0 {
+        text.push_str(
+            "\nNo device is paired yet, so every request is declined. \
+             To pair a device, run `localsend-cli` in a terminal and press P on its request.",
+        );
+    }
+    text.push_str("\nReady to accept requests.");
+    text
+}
+
+/// The listening addresses of the server, one per line.
+fn listening_text(server: &ServerHandle) -> String {
+    match listening_lines(&server.local_addresses(), "https") {
+        lines if lines.is_empty() => " - (no network interface found)".to_string(),
+        lines => lines.join("\n"),
+    }
 }
 
 /// One line per IPv4 address, but only one per IPv6 scope (global,
