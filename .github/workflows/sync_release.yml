@@ -1,0 +1,179 @@
+name: Sync release
+
+# This workflow exists only in the fork. It keeps two branches up to date:
+#   main     an exact copy of upstream/main (fast-forward only).
+#   release  upstream/main plus the fork commits, rebased on every run.
+#
+# Setup in the fork:
+#   1. Create a fine-grained personal access token for this repository with
+#      "Contents: read and write" and "Workflows: read and write".
+#   2. Save it as the repository secret SYNC_TOKEN.
+#      The default GITHUB_TOKEN cannot push upstream commits that change
+#      workflow files.
+#   3. Set the default branch of the fork to release.
+#      GitHub only lists a manual workflow when the file is on the default branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Build the CLI and publish a GitHub release after the sync
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/localsend/localsend.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.result.outputs.sha }}
+      version: ${{ steps.result.outputs.version }}
+      upstream_sha: ${{ steps.result.outputs.upstream_sha }}
+
+    steps:
+      - name: Make sure that the token secret exists
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::The secret SYNC_TOKEN is not set. Read the setup steps at the top of this workflow."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: release
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream main
+          echo "OLD_RELEASE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # A push without --force fails if main has a commit that upstream does not have.
+      # In that case, fix main by hand.
+      - name: Copy upstream/main to main
+        run: git push origin refs/remotes/upstream/main:refs/heads/main
+
+      - name: Rebase release onto upstream/main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git rebase upstream/main; then
+            git status --short
+            git rebase --abort
+            echo "::error::The rebase has conflicts. Rebase the release branch by hand, then push it with --force-with-lease."
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: rustup toolchain install # version from rust-toolchain.toml
+
+      - name: Run the CLI tests
+        run: cargo test --package localsend-cli
+
+      - name: Push release
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$OLD_RELEASE" ]; then
+            echo "The release branch is already up to date."
+          else
+            git push --force-with-lease="release:$OLD_RELEASE" origin HEAD:refs/heads/release
+          fi
+
+      - name: Write the result
+        id: result
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n 1)
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    if: ${{ inputs.publish }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            suffix: linux-x86-64
+          - runner: ubuntu-22.04-arm
+            suffix: linux-arm-64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Build the commit that the sync job pushed, not the commit that started this run.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Install Rust
+        run: rustup toolchain install # version from rust-toolchain.toml
+
+      - name: Compile CLI
+        run: cargo build --release --package localsend-cli
+
+      # tar keeps the executable bit, which a bare artifact upload loses
+      - name: Create tar.gz archive
+        env:
+          VERSION: ${{ needs.sync.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: tar -czvf "LocalSend-CLI-$VERSION-$SUFFIX.tar.gz" -C target/release localsend-cli
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v6
+        with:
+          name: cli-${{ matrix.suffix }}-result
+          path: LocalSend-CLI-${{ needs.sync.outputs.version }}-${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download CLI archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: cli-*-result
+          merge-multiple: true
+
+      # The tag is the upstream version plus a fork counter, for example v1.18.2-fork.1.
+      # The counter starts again at 1 for each upstream version.
+      - name: Choose the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$VERSION-fork." --jq 'length')
+          echo "TAG=v$VERSION-fork.$((COUNT + 1))" >> "$GITHUB_ENV"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          {
+            echo "This release is the fork build of the LocalSend CLI $VERSION."
+            echo "It contains the upstream commits and the fork commits on top of them."
+            echo
+            echo "Fork commit: $SHA"
+            echo "Upstream commit: $UPSTREAM_SHA"
+          } > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "CLI $VERSION with fork changes ($TAG)" --notes-file notes.md \
+            LocalSend-CLI-*.tar.gz
