@@ -28,6 +28,9 @@ pub enum Command {
         #[arg(value_name = "PATH", required_unless_present = "text", num_args = 1..)]
         paths: Vec<PathBuf>,
     },
+
+    /// Receive files without a terminal: accept paired devices and decline all others
+    Receive,
 }
 
 /// LocalSend CLI
@@ -158,6 +161,18 @@ mod tests {
     #[test]
     fn requires_a_destination_for_text() {
         assert!(Args::try_parse_from(["localsend-cli", "send", "--text", "hello"]).is_err());
+    }
+
+    #[test]
+    fn accepts_the_receive_command() {
+        let args = Args::try_parse_from(["localsend-cli", "receive"]).unwrap();
+
+        assert!(matches!(args.command, Some(Command::Receive)));
+    }
+
+    #[test]
+    fn receive_takes_no_paths() {
+        assert!(Args::try_parse_from(["localsend-cli", "receive", "one.txt"]).is_err());
     }
 
     #[test]
